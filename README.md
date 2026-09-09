@@ -2,7 +2,7 @@
 
 A small localhost-only page showing the remaining Codex usage attached to your ChatGPT plan, including reset times.
 
-It uses the Codex CLI's local App Server method `account/rateLimits/read`. It does **not** read `~/.codex/auth.json`, browser cookies, OAuth tokens, or call the private ChatGPT usage endpoint itself.
+It uses the Codex CLI's local App Server method `account/rateLimits/read`. It does not read `~/.codex/auth.json`, browser cookies, OAuth tokens, or call the private ChatGPT usage endpoint itself.
 
 ## Requirements
 
