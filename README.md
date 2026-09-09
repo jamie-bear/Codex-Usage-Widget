@@ -1,15 +1,15 @@
 # Local Codex Usage Widget
 
-A small localhost-only page showing the **remaining Codex usage** attached to your ChatGPT plan, including reset times.
+A small localhost-only page showing the remaining Codex usage attached to your ChatGPT plan, including reset times.
 
 It uses the Codex CLI's local App Server method `account/rateLimits/read`. It does **not** read `~/.codex/auth.json`, browser cookies, OAuth tokens, or call the private ChatGPT usage endpoint itself.
 
 ## Requirements
 
-1. **Codex CLI** installed and signed in with the same ChatGPT account you use in Codex Desktop.
+1. Codex CLI installed and signed in with the same ChatGPT account you use in Codex Desktop.
    - Check with: `codex --version`
    - If needed, run `codex` and complete ChatGPT sign-in.
-2. **Python 3.10+**.
+2. Python 3.10+.
 
 ## macOS 26
 
