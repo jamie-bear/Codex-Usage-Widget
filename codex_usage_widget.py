@@ -77,7 +77,7 @@ PAGE = r'''<!doctype html>
   <section id="limits"></section>
   <div id="credits" class="credits"></div>
   <div id="error"></div>
-  <footer><span id="updated">Connecting…</span><span>localhost only</span></footer>
+  <footer><span id="updated">Connecting…</span></footer>
 </main>
 <script>
 const limitsEl=document.getElementById('limits');
