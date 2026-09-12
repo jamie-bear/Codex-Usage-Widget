@@ -56,6 +56,8 @@ http://127.0.0.1:8765/
 
 The browser refreshes once per minute. The Python server caches readings briefly so repeated page loads do not hammer the App Server.
 
+The tab title updates with each reading, for example `Codex Usage | 89% w` or `Codex Usage | 75% 5h`. When both windows are available, it shows the one with the least remaining usage. If an update fails, the title shows `Codex Usage | Update failed` until the next successful refresh.
+
 ## Troubleshooting
 
 ### `Could not find the codex CLI in PATH`
