@@ -17,6 +17,7 @@ import atexit
 import json
 import os
 import queue
+import secrets
 import shutil
 import signal
 import subprocess
@@ -27,11 +28,14 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
+from urllib.request import getproxies
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 RPC_TIMEOUT = 20.0
 CACHE_SECONDS = 15.0
+RETRY_DELAY = 1.0
 
 FAVICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="#0BDB9D" class="bi bi-openai" viewBox="0 0 16 16">
   <path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/>
@@ -66,6 +70,7 @@ PAGE = r'''<!doctype html>
   footer { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:14px; color:var(--muted); font-size:12px; }
   button { font:inherit; color:inherit; background:transparent; border:1px solid var(--line); border-radius:9px; padding:5px 9px; cursor:pointer; }
   button:hover { background:rgba(127,127,127,.12); }
+  button:disabled { opacity:.5; cursor:default; }
   #error { color:var(--error); white-space:pre-wrap; padding-top:10px; }
   .empty { color:var(--muted); padding:10px 0; }
   .credits { color:var(--muted); font-size:12px; margin-top:10px; }
@@ -76,8 +81,8 @@ PAGE = r'''<!doctype html>
   <header><div><h1>Codex usage</h1><div class="plan" id="plan">Loading…</div></div><button id="refresh" type="button">Refresh</button></header>
   <section id="limits"></section>
   <div id="credits" class="credits"></div>
-  <div id="error"></div>
-  <footer><span id="updated">Connecting…</span></footer>
+  <div id="error" role="status"></div>
+  <footer><span id="updated">Connecting…</span><button id="stop" type="button" title="Stop this widget and its Codex helper">Kill process</button></footer>
 </main>
 <script>
 const limitsEl=document.getElementById('limits');
@@ -85,6 +90,12 @@ const planEl=document.getElementById('plan');
 const updatedEl=document.getElementById('updated');
 const errorEl=document.getElementById('error');
 const creditsEl=document.getElementById('credits');
+const refreshEl=document.getElementById('refresh');
+const stopEl=document.getElementById('stop');
+let stopped=false;
+let refreshing=false;
+let lastUpdated='';
+let refreshController;
 
 function resetText(ts) {
   if (!ts) return 'Reset time unavailable';
@@ -116,26 +127,61 @@ function render(data) {
   const c=data.credits;
   if (c && c.hasCredits) creditsEl.textContent=c.unlimited ? 'Credits: unlimited' : `Credits: ${c.balance ?? 'available'}`;
   else creditsEl.textContent='';
-  updatedEl.textContent=`Updated ${new Date(data.fetchedAt*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`;
+  lastUpdated=`Updated ${new Date(data.fetchedAt*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`;
+  updatedEl.textContent=lastUpdated;
 }
-async function refresh() {
-  document.getElementById('refresh').disabled=true;
+async function refresh(force=false) {
+  if (stopped || refreshing) return;
+  refreshing=true;
+  refreshEl.disabled=true;
+  refreshController=new AbortController();
+  const timeout=setTimeout(()=>refreshController.abort(), 90000);
   try {
-    const r=await fetch('/api/usage', {cache:'no-store'});
+    const r=await fetch(force ? '/api/usage?refresh=1' : '/api/usage', {cache:'no-store',signal:refreshController.signal});
     const j=await r.json();
+    if (stopped) return;
     if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
     render(j);
   } catch(e) {
+    if (stopped) return;
     document.title='Codex Usage | Update failed';
-    errorEl.textContent=e.message;
-    updatedEl.textContent='Update failed';
+    errorEl.textContent=e.name==='AbortError' ? 'The update timed out. Check the connection and try Refresh.' : e.message;
+    if (!lastUpdated) planEl.textContent='Usage unavailable';
+    updatedEl.textContent=lastUpdated ? `${lastUpdated} · Update failed` : 'Update failed';
   } finally {
-    document.getElementById('refresh').disabled=false;
+    clearTimeout(timeout);
+    refreshing=false;
+    refreshEl.disabled=stopped;
   }
 }
-document.getElementById('refresh').addEventListener('click',refresh);
+async function stopWidget() {
+  if (stopped) return;
+  stopped=true;
+  stopEl.disabled=true;
+  refreshEl.disabled=true;
+  refreshController?.abort();
+  updatedEl.textContent='Stopping…';
+  try {
+    const r=await fetch('/api/shutdown', {method:'POST',headers:{'X-Widget-Token':'__SHUTDOWN_TOKEN__'}});
+    if (!r.ok) throw new Error(`Could not stop the widget (HTTP ${r.status}).`);
+    clearInterval(refreshTimer);
+    document.title='Codex Usage | Stopped';
+    errorEl.textContent='';
+    planEl.textContent='Stopped';
+    updatedEl.textContent='Widget stopped. Close this tab.';
+    stopEl.textContent='Stopped';
+  } catch(e) {
+    stopped=false;
+    stopEl.disabled=false;
+    refreshEl.disabled=refreshing;
+    errorEl.textContent=e.message;
+    updatedEl.textContent='Shutdown failed';
+  }
+}
+refreshEl.addEventListener('click',()=>refresh(true));
+stopEl.addEventListener('click',stopWidget);
 refresh();
-setInterval(refresh, 60000);
+const refreshTimer=setInterval(refresh, 60000);
 </script>
 </body>
 </html>'''
@@ -152,6 +198,7 @@ class CodexAppServer:
         self._write_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
         self._next_id = 1
+        self._stopping = threading.Event()
         self._codex = self._find_codex()
 
     @staticmethod
@@ -161,6 +208,17 @@ class CodexAppServer:
             return explicit
         found = shutil.which("codex.exe") if os.name == "nt" else None
         found = found or shutil.which("codex")
+        if not found and sys.platform == "darwin":
+            # Finder launches can have a smaller PATH than an interactive shell.
+            for candidate in (
+                os.path.expanduser("~/.local/bin/codex"),
+                "/opt/homebrew/bin/codex", "/usr/local/bin/codex",
+                "/Applications/Codex.app/Contents/Resources/codex",
+                "/Applications/ChatGPT.app/Contents/Resources/codex",
+            ):
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    found = candidate
+                    break
         if not found:
             raise RuntimeError(
                 "Could not find the `codex` CLI in PATH. Install Codex, restart the terminal, "
@@ -176,6 +234,8 @@ class CodexAppServer:
 
     def start(self) -> None:
         with self._lifecycle_lock:
+            if self._stopping.is_set():
+                raise RuntimeError("Widget is stopping.")
             if self.proc and self.proc.poll() is None:
                 return
             self.close()
@@ -194,6 +254,7 @@ class CodexAppServer:
                 bufsize=1,
                 shell=use_shell,
                 creationflags=creationflags,
+                env=app_server_environment(),
             )
             self._reader = threading.Thread(target=self._reader_loop, args=(self.proc,), daemon=True)
             self._reader.start()
@@ -224,7 +285,10 @@ class CodexAppServer:
                     with self._pending_lock:
                         q = self._pending.get(request_id)
                     if q:
-                        q.put(msg)
+                        try:
+                            q.put_nowait(msg)
+                        except queue.Full:
+                            pass
         finally:
             err = {"error": {"message": "Codex app-server stopped unexpectedly."}}
             with self._pending_lock:
@@ -286,11 +350,24 @@ class CodexAppServer:
                 try:
                     self.start()
                     return self._rpc("account/rateLimits/read", timeout=RPC_TIMEOUT)
-                except Exception:
+                except Exception as exc:
                     self.close()
-                    if attempt == 1:
-                        raise
+                    if attempt == 1 or self._stopping.is_set():
+                        raise RuntimeError(usage_error_message(exc)) from exc
+                    # Give transient network failures time to recover before reconnecting.
+                    if self._stopping.wait(RETRY_DELAY):
+                        raise RuntimeError("Widget is stopping.") from exc
             raise RuntimeError("Unable to read Codex rate limits.")
+
+    def request_stop(self) -> None:
+        # Interrupt a pending RPC without waiting for its lifecycle lock/timeout.
+        self._stopping.set()
+        proc = self.proc
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
 
     def close(self) -> None:
         with self._lifecycle_lock:
@@ -309,8 +386,49 @@ class CodexAppServer:
                 except Exception:
                     try:
                         proc.kill()
+                        proc.wait(timeout=2)
                     except Exception:
                         pass
+            if self._reader and self._reader is not threading.current_thread():
+                self._reader.join(timeout=2)
+            for stream in (proc.stdout, proc.stderr):
+                if stream:
+                    stream.close()
+
+
+def app_server_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    # urllib discovers macOS System Settings proxies as well as environment
+    # variables. The CLI HTTP client needs the latter when launched from Finder.
+    proxies = getproxies()
+    for scheme in ("http", "https", "all"):
+        key = f"{scheme}_proxy"
+        if scheme in proxies and key not in env and key.upper() not in env:
+            env[key.upper()] = proxies[scheme]
+    if "no" in proxies and "no_proxy" not in env and "NO_PROXY" not in env:
+        env["NO_PROXY"] = proxies["no"]
+    return env
+
+
+def usage_error_message(exc: Exception) -> str:
+    message = str(exc)
+    lowered = message.lower()
+    if "error sending request" in lowered or "timed out" in lowered:
+        return (
+            "Codex could not connect to ChatGPT to read usage. Check your internet, "
+            "VPN/proxy and firewall settings, then click Refresh. If launched from "
+            "a restricted Codex terminal, restart using start-macos.command or "
+            "start-windows.cmd outside Codex.\n\nDetails: " + message
+        )
+    if any(marker in lowered for marker in (
+        "401", "unauthorized", "not logged in", "authentication required",
+    )):
+        return (
+            "The Codex CLI needs a ChatGPT sign-in. Run `codex login` in Terminal, "
+            "complete sign-in, then click Refresh. Signing in to Codex Desktop "
+            "alone does not sign in this CLI helper.\n\nDetails: " + message
+        )
+    return message
 
 
 def _window_label(minutes: Any) -> str:
@@ -386,19 +504,20 @@ class UsageCache:
         self.data: dict[str, Any] | None = None
         self.at = 0.0
 
-    def get(self) -> dict[str, Any]:
+    def get(self, force: bool = False) -> dict[str, Any]:
         with self.lock:
             now = time.monotonic()
-            if self.data is not None and now - self.at < CACHE_SECONDS:
+            if not force and self.data is not None and now - self.at < CACHE_SECONDS:
                 return self.data
             raw = self.app_server.get_rate_limits()
             self.data = normalize_rate_limits(raw)
-            self.at = now
+            self.at = time.monotonic()
             return self.data
 
 
 class WidgetHandler(BaseHTTPRequestHandler):
     cache: UsageCache
+    shutdown_token: str
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Keep the terminal quiet except for startup/errors.
@@ -415,7 +534,7 @@ class WidgetHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
-            body = PAGE.encode("utf-8")
+            body = PAGE.replace("__SHUTDOWN_TOKEN__", self.shutdown_token).encode("utf-8")
             self._headers(HTTPStatus.OK, "text/html; charset=utf-8")
             self.wfile.write(body)
             return
@@ -425,7 +544,8 @@ class WidgetHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/usage":
             try:
-                payload = self.cache.get()
+                query = parse_qs(urlsplit(self.path).query)
+                payload = self.cache.get(force=query.get("refresh") == ["1"])
                 body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
                 self._headers(HTTPStatus.OK, "application/json; charset=utf-8")
             except Exception as exc:
@@ -435,6 +555,23 @@ class WidgetHandler(BaseHTTPRequestHandler):
             return
         self._headers(HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8")
         self.wfile.write(b"Not found")
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/api/shutdown":
+            self._headers(HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8")
+            self.wfile.write(b"Not found")
+            return
+        # A per-run token prevents another website from stopping the local server.
+        token = self.headers.get("X-Widget-Token", "")
+        if not secrets.compare_digest(token, self.shutdown_token):
+            self._headers(HTTPStatus.FORBIDDEN, "application/json; charset=utf-8")
+            self.wfile.write(b'{"error":"Invalid widget token"}')
+            return
+        self._headers(HTTPStatus.OK, "application/json; charset=utf-8")
+        self.wfile.write(b'{"stopped":true}')
+        self.wfile.flush()
+        self.cache.app_server.request_stop()
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
 
 
 def main() -> int:
@@ -447,6 +584,14 @@ def main() -> int:
         print("Python 3.10 or newer is required.", file=sys.stderr)
         return 2
 
+    if os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1":
+        print(
+            "This terminal has network access disabled. Launch start-macos.command "
+            "from Finder or start-windows.cmd from Explorer so the widget can reach ChatGPT.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         app_server = CodexAppServer()
     except Exception as exc:
@@ -455,6 +600,7 @@ def main() -> int:
     atexit.register(app_server.close)
 
     WidgetHandler.cache = UsageCache(app_server)
+    WidgetHandler.shutdown_token = secrets.token_urlsafe(32)
     try:
         httpd = ThreadingHTTPServer((DEFAULT_HOST, args.port), WidgetHandler)
     except OSError as exc:
@@ -469,6 +615,7 @@ def main() -> int:
         threading.Timer(0.35, lambda: webbrowser.open(url)).start()
 
     def stop(_signum: int, _frame: Any) -> None:
+        app_server.request_stop()
         threading.Thread(target=httpd.shutdown, daemon=True).start()
 
     try:
